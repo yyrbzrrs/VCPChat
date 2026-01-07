@@ -43,69 +43,89 @@ class AgentConfigManager extends EventEmitter {
     }
 
     async readAgentConfig(agentId) {
-        const { configPath } = this.getAgentPaths(agentId);
-        
-        try {
-            // 使用缓存机制减少文件读取
-            const stats = await fs.stat(configPath).catch(() => null);
-            const cacheKey = agentId;
-            const cachedConfig = this.caches.get(cacheKey);
-            const cacheTimestamp = this.cacheTimestamps.get(cacheKey) || 0;
-            
-            if (stats && cachedConfig && stats.mtimeMs <= cacheTimestamp) {
-                return { ...cachedConfig };
-            }
+        const { agentPath, configPath } = this.getAgentPaths(agentId);
+        let retryCount = 0;
+        const maxRetries = 3;
 
-            const content = await fs.readFile(configPath, 'utf8');
-            const config = JSON.parse(content);
-            
-            // 更新缓存
-            this.caches.set(cacheKey, config);
-            this.cacheTimestamps.set(cacheKey, stats ? stats.mtimeMs : Date.now());
-            
-            return { ...config };
-        } catch (error) {
-            if (error.code === 'ENOENT') {
-                // 返回默认配置
-                const defaultConfig = {
-                    name: agentId,
-                    systemPrompt: `你是 ${agentId}。`,
-                    model: 'gemini-2.5-flash-preview-05-20',
-                    temperature: 0.7,
-                    contextTokenLimit: 1000000,
-                    maxOutputTokens: 60000,
-                    topics: [{ id: "default", name: "主要对话", createdAt: Date.now() }]
-                };
-                return { ...defaultConfig };
-            }
-            
-            console.error(`Error reading agent ${agentId} config, attempting recovery:`, error);
-            
-            // 尝试从备份恢复
-            const backupPath = configPath + '.backup';
-            if (await fs.pathExists(backupPath)) {
-                try {
-                    const backupContent = await fs.readFile(backupPath, 'utf8');
-                    const backupConfig = JSON.parse(backupContent);
-                    console.log(`Recovered agent ${agentId} config from backup`);
-                    return { ...backupConfig };
-                } catch (backupError) {
-                    console.error(`Agent ${agentId} backup also corrupted:`, backupError);
+        while (retryCount <= maxRetries) {
+            try {
+                // 使用缓存机制减少文件读取
+                const stats = await fs.stat(configPath).catch(() => null);
+                const cacheKey = agentId;
+                const cachedConfig = this.caches.get(cacheKey);
+                const cacheTimestamp = this.cacheTimestamps.get(cacheKey) || 0;
+                
+                if (stats && cachedConfig && stats.mtimeMs <= cacheTimestamp) {
+                    return { ...cachedConfig };
                 }
+
+                const content = await fs.readFile(configPath, 'utf8');
+                const config = JSON.parse(content);
+                
+                // 更新缓存
+                this.caches.set(cacheKey, config);
+                this.cacheTimestamps.set(cacheKey, stats ? stats.mtimeMs : Date.now());
+                
+                return { ...config };
+            } catch (error) {
+                if (error.code === 'ENOENT') {
+                    // 检查Agent文件夹是否存在
+                    const dirExists = await fs.pathExists(agentPath);
+                    if (dirExists) {
+                        // 文件夹在但文件不在，可能是原子替换瞬间，尝试重试
+                        if (retryCount < maxRetries) {
+                            retryCount++;
+                            console.warn(`Agent ${agentId} config file missing but directory exists. Retrying (${retryCount}/${maxRetries})...`);
+                            await new Promise(resolve => setTimeout(resolve, 50));
+                            continue;
+                        }
+                        // 重试耗尽，抛出错误以保护数据，严禁返回默认配置
+                        throw new Error(`Agent ${agentId} config file missing in existing directory after retries. Safety fuse triggered to prevent data loss.`);
+                    }
+
+                    // 文件夹也不存在，说明是新Agent，返回默认配置
+                    const defaultConfig = {
+                        name: agentId,
+                        systemPrompt: `你是 ${agentId}。`,
+                        model: 'gemini-2.5-flash-preview-05-20',
+                        temperature: 0.7,
+                        contextTokenLimit: 1000000,
+                        maxOutputTokens: 60000,
+                        topics: [{ id: "default", name: "主要对话", createdAt: Date.now() }]
+                    };
+                    return { ...defaultConfig };
+                }
+                
+                console.error(`Error reading agent ${agentId} config, attempting recovery:`, error);
+                break; // 其他错误不重试
             }
-            
-            // 最后的手段：返回默认配置
-            const defaultConfig = {
-                name: agentId,
-                systemPrompt: `你是 ${agentId}。`,
-                model: 'gemini-2.5-flash-preview-05-20',
-                temperature: 0.7,
-                contextTokenLimit: 1000000,
-                maxOutputTokens: 60000,
-                topics: [{ id: "default", name: "主要对话", createdAt: Date.now() }]
-            };
-            return { ...defaultConfig };
         }
+
+        // 如果执行到这里，说明发生了非 ENOENT 错误或重试失败
+        // 尝试从备份恢复
+        const backupPath = configPath + '.backup';
+        if (await fs.pathExists(backupPath)) {
+            try {
+                const backupContent = await fs.readFile(backupPath, 'utf8');
+                const backupConfig = JSON.parse(backupContent);
+                console.log(`Recovered agent ${agentId} config from backup`);
+                return { ...backupConfig };
+            } catch (backupError) {
+                console.error(`Agent ${agentId} backup also corrupted:`, backupError);
+            }
+        }
+        
+        // 最后的手段：返回默认配置
+        const defaultConfig = {
+            name: agentId,
+            systemPrompt: `你是 ${agentId}。`,
+            model: 'gemini-2.5-flash-preview-05-20',
+            temperature: 0.7,
+            contextTokenLimit: 1000000,
+            maxOutputTokens: 60000,
+            topics: [{ id: "default", name: "主要对话", createdAt: Date.now() }]
+        };
+        return { ...defaultConfig };
     }
 
     async writeAgentConfig(agentId, config) {
